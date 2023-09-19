@@ -40,7 +40,8 @@ class RWKVOnnxOps():
             if isinstance(x, list):
                 xx = np.array(x).astype(npdtype)
             else:
-                xx = x.squeeze().float().cpu().numpy()
+                # xx = x.squeeze().float().cpu().numpy()
+                xx = x.float().cpu().numpy()
                 # convert to float32
                 xx = xx.astype(npdtype)
             rrx = onnx.helper.make_tensor(
@@ -102,12 +103,13 @@ class RWKVOnnxOps():
 
         def sqrt(x):
             name = f"sqrt_{self.nm}_out"
-            self.nm += 1
             node = onnx.helper.make_node(
                 'Sqrt',
                 inputs=[x],
-                outputs=[name]
+                outputs=[name],
+                name=str(self.nm),
             )
+            self.nm += 1
             self.NodeList.append(node)
 
             return name
@@ -163,13 +165,13 @@ class RWKVOnnxOps():
 
         def matvec(x, y, outputfp32 = False):
             name = f"matvec_{self.nm}_out"
-            oname = f"matvec_g_{self.nm}_out"
-            self.nm += 1
             node = onnx.helper.make_node(
                 'MatMul',
                 inputs=[x, y],
-                outputs=[name]
+                outputs=[name],
+                name=str(self.nm),
             )
+            self.nm += 1
             self.NodeList.append(node)
             if outputfp32:
                 return self.convertToFloat32(name)
@@ -196,12 +198,13 @@ class RWKVOnnxOps():
 
         def mul(x, y):
             name = f"mul_{self.nm}_out"
-            self.nm += 1
             node = onnx.helper.make_node(
                 'Mul',
                 inputs=[x, y],
-                outputs=[name]
+                outputs=[name],
+                name=str(self.nm),
             )
+            self.nm += 1
             self.NodeList.append(node)
 
             return name
@@ -224,12 +227,13 @@ class RWKVOnnxOps():
         def add(x, y):
 
             name = f"add_{self.nm}_out"
-            self.nm += 1
             node = onnx.helper.make_node(
                 'Add',
                 inputs=[x, y],
-                outputs=[name]
+                outputs=[name],
+                name=str(self.nm),
             )
+            self.nm += 1
             self.NodeList.append(node)
 
             return name
@@ -308,6 +312,23 @@ class RWKVOnnxOps():
             return name
 
         self.divide = divide
+
+        def groupnorm18(x, w, b, num_groups, epsilon):
+            ln_outs = []
+            for i in num_groups:
+                name = f"layernorm_{self.nm}_out"
+                node = onnx.helper.make_node(
+                    'LayerNormalization',
+                    inputs=[x, w, b],
+                    outputs=[name],
+                    num_groups=num_groups,
+                    epsilon=epsilon,
+                )
+                self.nm += 1
+            self.NodeList.append(node)
+
+            return name 
+        self.groupnorm18 = groupnorm18
 
         def layernorm17(x, w, b):
             name = f"layernorm_{self.nm}_out"
@@ -408,6 +429,31 @@ class RWKVOnnxOps():
             return name
         self.unsqueeze = unsqueeze
 
+        def reshape(x, shape):
+            shape_name = f"shape_{self.nm}"
+            self.nm += 1
+            shape_tensor = onnx.helper.make_tensor(
+                shape_name,
+                data_type=onnx.TensorProto.INT64,
+                dims=(len(shape),),
+                vals=shape,
+            )
+            self.TensorList.append(shape_tensor)
+            name = f"reshape_{self.nm}_out"
+            self.nm += 1
+            node = onnx.helper.make_node(
+                "Reshape",
+                inputs=[x, shape_name],
+                outputs=[name],
+            )
+            self.NodeList.append(node)
+            return name
+        self.reshape = reshape
+
+        def pytorch_flatten(x):
+            return reshape(x, [-1])
+        self.pytorch_flatten = pytorch_flatten
+
         def slice(x, axes=0, starts=0, ends=-1):
             axes_name = f"slice_axes_init_{self.nm}"
             self.nm += 1
@@ -491,9 +537,21 @@ class RWKVOnnxOps():
                                                              onnx.TensorProto.INT32,
                                                              [1] if not self.seq_mode else [self.seq_length]), "input0"
 
-            emptyState = list(map(lambda x: (onnx.helper.make_tensor_value_info("instate"+str(x),
-                                                                                onnx.TensorProto.FLOAT if fp32inout else dtype,
-                                                                                [embed]), "instate"+str(x)), range((4+useSafeWKV)*layers)))
+            emptyState = []
+            for i in range(layers):
+                emptyState.append((onnx.helper.make_tensor_value_info("instate"+str(i * 3),
+                                                                                  onnx.TensorProto.FLOAT if fp32inout else dtype,
+                                                                                  [embed]), "instate"+str(i * 3 + 0)))
+                emptyState.append((onnx.helper.make_tensor_value_info("instate"+str(i * 3 + 1),
+                                                                                  onnx.TensorProto.FLOAT if fp32inout else dtype,
+                                                                                  [8, 64, 64]), "instate"+str(i * 3 + 1)))
+                emptyState.append((onnx.helper.make_tensor_value_info("instate"+str(i * 3 + 2),
+                                                                                  onnx.TensorProto.FLOAT if fp32inout else dtype,
+                                                                                  [embed]), "instate"+str(i * 3 + 2)))
+
+            # emptyState = list(map(lambda x: (onnx.helper.make_tensor_value_info("instate"+str(x),
+            #                                                                     onnx.TensorProto.FLOAT if fp32inout else dtype,
+            #                                                                     [embed]), "instate"+str(x)), range((4+useSafeWKV)*layers)))
             if self.seq_mode:
                 outs = x.forwardSeq(
                     inputtensor[1], list(map(lambda x: x[1], emptyState)))
@@ -506,9 +564,17 @@ class RWKVOnnxOps():
             logits = onnx.helper.make_tensor_value_info(outs[0],
                                                         onnx.TensorProto.FLOAT if fp32inout else dtype,
                                                         [50277] if not self.seq_mode else [self.seq_length, 50277])
-            state = list(map(lambda x: onnx.helper.make_tensor_value_info(x,
-                                                                          onnx.TensorProto.FLOAT if fp32inout else dtype,
-                                                                          [embed]), outs[1]))
+            # state = list(map(lambda x: onnx.helper.make_tensor_value_info(x,
+            #                                                               onnx.TensorProto.FLOAT if fp32inout else dtype,
+            #                                                               [embed]), outs[1]))
+            state = []
+            for i, x in enumerate(outs[1]):
+                shape = [embed]
+                if i % 3 == 1:
+                    shape = [8, 64, 64]
+                state.append(onnx.helper.make_tensor_value_info(x,
+                                                                onnx.TensorProto.FLOAT if fp32inout else dtype,
+                                                                shape))
 
             # Create the graph (GraphProto)
             graph_def = onnx.helper.make_graph(
