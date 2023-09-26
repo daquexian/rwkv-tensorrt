@@ -313,22 +313,20 @@ class RWKVOnnxOps():
 
         self.divide = divide
 
-        def groupnorm18(x, w, b, num_groups, epsilon):
+        # ONNX groupnorm is broken (https://github.com/onnx/onnx/issues/5466)
+        # so we have to implement it ourselves
+        def groupnorm(x, w, b, num_groups, epsilon):
+            assert epsilon == 1e-5
             ln_outs = []
-            for i in num_groups:
-                name = f"layernorm_{self.nm}_out"
-                node = onnx.helper.make_node(
-                    'LayerNormalization',
-                    inputs=[x, w, b],
-                    outputs=[name],
-                    num_groups=num_groups,
-                    epsilon=epsilon,
-                )
+            for i in range(num_groups):
+                x_slice = self.slice(x, axes=1, starts=i*embed//num_groups, ends=(i+1)*embed//num_groups)
+                w_slice = self.slice(w, axes=0, starts=i*embed//num_groups, ends=(i+1)*embed//num_groups)
+                b_slice = self.slice(b, axes=0, starts=i*embed//num_groups, ends=(i+1)*embed//num_groups)
+                ln_outs.append(self.layernorm(x_slice, w_slice, b_slice))
                 self.nm += 1
-            self.NodeList.append(node)
+            return self.concate(*ln_outs, axis=1)
 
-            return name 
-        self.groupnorm18 = groupnorm18
+        self.groupnorm = groupnorm
 
         def layernorm17(x, w, b):
             name = f"layernorm_{self.nm}_out"
@@ -497,12 +495,12 @@ class RWKVOnnxOps():
             return name
         self.slice = slice
 
-        def concate(x, y, axis=0):
+        def concate(*args, axis=0):
             name = f"concate_{self.nm}_out"
             self.nm += 1
             node = onnx.helper.make_node(
                 "Concat",
-                inputs=[x, y],
+                inputs=args,
                 outputs=[name],
                 axis=axis
             )
@@ -544,7 +542,8 @@ class RWKVOnnxOps():
                                                                                   [embed]), "instate"+str(i * 3 + 0)))
                 emptyState.append((onnx.helper.make_tensor_value_info("instate"+str(i * 3 + 1),
                                                                                   onnx.TensorProto.FLOAT if fp32inout else dtype,
-                                                                                  [8, 64, 64]), "instate"+str(i * 3 + 1)))
+                                                                                  # NOTE: hardcode
+                                                                                  [14, 64, 64]), "instate"+str(i * 3 + 1)))
                 emptyState.append((onnx.helper.make_tensor_value_info("instate"+str(i * 3 + 2),
                                                                                   onnx.TensorProto.FLOAT if fp32inout else dtype,
                                                                                   [embed]), "instate"+str(i * 3 + 2)))
@@ -563,7 +562,9 @@ class RWKVOnnxOps():
             print(outs)
             logits = onnx.helper.make_tensor_value_info(outs[0],
                                                         onnx.TensorProto.FLOAT if fp32inout else dtype,
-                                                        [50277] if not self.seq_mode else [self.seq_length, 50277])
+                                                        # [50277] if not self.seq_mode else [self.seq_length, 50277])
+                                                        # NOTE: hardcode
+                                                        [20096] if not self.seq_mode else [self.seq_length, 50277])
             # state = list(map(lambda x: onnx.helper.make_tensor_value_info(x,
             #                                                               onnx.TensorProto.FLOAT if fp32inout else dtype,
             #                                                               [embed]), outs[1]))
@@ -571,7 +572,9 @@ class RWKVOnnxOps():
             for i, x in enumerate(outs[1]):
                 shape = [embed]
                 if i % 3 == 1:
-                    shape = [8, 64, 64]
+                    # NOTE: hardcode
+                    shape = [14, 64, 64]
+                print(i, shape)
                 state.append(onnx.helper.make_tensor_value_info(x,
                                                                 onnx.TensorProto.FLOAT if fp32inout else dtype,
                                                                 shape))

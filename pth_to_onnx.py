@@ -43,12 +43,18 @@ def RnnRWKV(ops: onnx_opslist.RWKVOnnxOps, *args):
                 [w[f"blocks.{x}.att.time_mix_v"] for x in range(ops.n_layers)]))
             self.rrtr = (ops.stack(
                 [w[f"blocks.{x}.att.time_mix_r"] for x in range(ops.n_layers)]))
+            if version == 5.1:
+                self.ggtg = (ops.stack(
+                    [w[f"blocks.{x}.att.time_mix_g"] for x in range(ops.n_layers)]))
             self.key = (ops.stack(
                 [w[f"blocks.{x}.att.key.weight"] for x in range(ops.n_layers)], exname="_key"))
             self.value = (ops.stack(
                 [w[f"blocks.{x}.att.value.weight"] for x in range(ops.n_layers)], exname="_value"))
             self.receptance = (ops.stack([
                 w[f"blocks.{x}.att.receptance.weight"] for x in range(ops.n_layers)], exname="_receptance"))
+            if version == 5.1:
+                self.gate = (ops.stack([
+                    w[f"blocks.{x}.att.gate.weight"] for x in range(ops.n_layers)], exname="_gate"))
             self.outputvv = (ops.stack([
                 w[f"blocks.{x}.att.output.weight"] for x in range(ops.n_layers)], exname="_outputvv"))
             self.time_mix_k_ffn = (ops.stack([
@@ -63,7 +69,7 @@ def RnnRWKV(ops: onnx_opslist.RWKVOnnxOps, *args):
                 w[f"blocks.{x}.ffn.value.weight"] for x in range(ops.n_layers)], exname="_value_ffn"))
             self.w = w;
 
-        def wkvsafe(self, k, v, xx, statee, stateb, statec):
+        def wkv(self, k, v, xx, statee, stateb, statec):
             ww = ops.add(k, self.time_first[xx])
             p = ops.maximum(statee, ww)
 
@@ -84,34 +90,6 @@ def RnnRWKV(ops: onnx_opslist.RWKVOnnxOps, *args):
 
             return ops.convertToFloat16(wkv), outb, outc, eee
 
-        def wkvunsafe(self, k, v, xx, statee, stateb, statec):
-            # // const double vv = v[i + token * emb];
-            #     // const double wr1 = aa + exp(float(u[i + emb * offset] + w[i + emb * offset] + k[i + token * emb])) * vv;
-            #     // const double wr2 = bb + exp(float(u[i + emb * offset] + w[i + emb * offset] + k[i + token * emb]));
-            #     // y[i + token * emb] = (wr1) / (wr2+0.001);
-            #     // y[i + token * emb] = (1.0 / (1.0 + exp(float(-r[i + token * emb])))) * y[i + token * emb];
-            #     // aa = (aa + exp(float(double(k[i + token * emb]))) * vv) * exp(float(w[i + emb * offset]));
-            #     // bb = (bb + exp(float(double(k[i + token * emb])))) * exp(float(w[i + emb * offset]));
-
-            td = ops.exp(self.time_decay[xx])
-            tf = ops.exp(self.time_first[xx])
-
-            ek = ops.exp(k)
-            ekk = ops.multiply(ek, tf)
-            a = ops.add(stateb, ops.multiply(ekk, v))
-            b = ops.add(statec, ekk)
-            wkv = ops.divide(a, ops.add(b, ops.margins))
-
-            outb = ops.add(stateb, ops.multiply(ek, v))
-            outc = ops.add(statec, ek)
-
-            outb = ops.multiply(td, outb)
-            outc = ops.multiply(td, outc)
-
-            eee = None
-
-            return ops.convertToFloat16(wkv), outb, outc, eee
-
         @ops.layerdef
         def doLayer(self, x, statea, stateb, statec, stated, statee, xx):
 
@@ -128,8 +106,7 @@ def RnnRWKV(ops: onnx_opslist.RWKVOnnxOps, *args):
                     self.receptance[xx], ops.lerp(statea, xy, self.rrtr[xx]))
                 r = ops.logistical((rr))
 
-                wkv, outb, outc, eee = self.wkvsafe(k, v, xx, statee, stateb, statec) if ops.useSafeWKV else self.wkvunsafe(
-                    k, v, xx, statee, stateb, statec)
+                wkv, outb, outc, eee = self.wkv(k, v, xx, statee, stateb, statec)
 
                 mvv = ops.add(x, ops.matvec(
                     self.outputvv[xx], ops.multiply(r, wkv)))
@@ -141,32 +118,29 @@ def RnnRWKV(ops: onnx_opslist.RWKVOnnxOps, *args):
                 H = self.w[f"blocks.{xx}.att.time_decay"].size(0)
                 assert self.w[f"blocks.{xx}.att.ln_x.weight"].size(0) % H == 0
                 S = self.w[f"blocks.{xx}.att.ln_x.weight"].size(0) // H
-                print('-'*30)
-                print(H)
-                print(S)
 
                 k = ops.matvec(
                     ops.lerp(statea, xy, self.kktk[xx]), self.key[xx], True)
-                k = ops.reshape(k, (H, 1, S))
+                k = ops.reshape(k, (H, S, 1))
 
                 v = ops.matvec(ops.lerp(
                     statea, xy, self.vvtv[xx]), self.value[xx], True)
-                v = ops.reshape(v, (H, S, 1))
+                v = ops.reshape(v, (H, 1, S))
                 r = ops.matvec(
                     ops.lerp(statea, xy, self.rrtr[xx]), self.receptance[xx])
                 r = ops.reshape(r, (H, 1, S))
+                g = ops.matvec(
+                    ops.lerp(statea, xy, self.ggtg[xx]), self.gate[xx])
+                g = ops.multiply(ops.logistical(g), g)
 
                 a = ops.matvec(k, v)
                 out = ops.matvec(r, ops.add(ops.multiply(self.time_first[xx], a), stateb) )
                 decayed_s = ops.add(ops.multiply(self.time_decay[xx], stateb), a)
 
                 out = ops.pytorch_flatten(out)
-                out = ops.groupnorm18(ops.unsqueeze(out, 0), self.lx_w[xx], self.lx_b[xx], H, 1e-5)
+                out = ops.groupnorm(ops.unsqueeze(out, 0), self.lx_w[xx], self.lx_b[xx], H, 1e-5)
                 out = ops.pytorch_flatten(out)
-
-                # wkv, outb, outc, eee = self.wkvsafe(k, v, xx, statee, stateb, statec) if ops.useSafeWKV else self.wkvunsafe(
-                #     k, v, xx, statee, stateb, statec)
-
+                out = ops.multiply(g, out)
 
                 mvv = ops.add(x, ops.matvec(out, self.outputvv[xx]))
                 state_ffn = statec
@@ -214,8 +188,7 @@ def RnnRWKV(ops: onnx_opslist.RWKVOnnxOps, *args):
             for t in range(self.seq_length):
                 kk = ops.squeeze(ops.slice(k, axes=0, starts=t, ends=t+1))
                 vv = ops.squeeze(ops.slice(v, axes=0, starts=t, ends=t+1))
-                temp, stateb, statec, statee = self.wkvsafe(kk, vv, i, statee, stateb, statec)\
-                      if ops.useSafeWKV else self.wkvunsafe(kk, vv, i, statee, stateb, statec)
+                temp, stateb, statec, statee = self.wkv(kk, vv, i, statee, stateb, statec)
                 state_list.append(ops.unsqueeze(temp))
             statea = ops.seq_concate(state_list, self.seq_length)
             mvv = ops.add(x, ops.matvec(ops.multiply(r, statea), self.outputvv[i]))
@@ -244,11 +217,11 @@ def RnnRWKV(ops: onnx_opslist.RWKVOnnxOps, *args):
                     ops.getIndex(self.emb, x),
                     self.emb1, self.emb2)
 
-            statea = state[0::(4+ops.useSafeWKV)]
-            stateb = state[1::(4+ops.useSafeWKV)]
-            statec = state[2::(4+ops.useSafeWKV)]
-            stated = state[3::(4+ops.useSafeWKV)]
-            statee = state[4::5] if ops.useSafeWKV else [None]*ops.n_layers
+            statea = state[0::5]
+            stateb = state[1::5]
+            statec = state[2::5]
+            stated = state[3::5]
+            statee = state[4::5]
 
             ot = []
             for i in range(ops.n_layers):
@@ -261,7 +234,7 @@ def RnnRWKV(ops: onnx_opslist.RWKVOnnxOps, *args):
                     (statee[i]),
                     i
                 )
-                ot = ot + ([( aaa), (bbb), (ccc), (ddd), (eee)] if ops.useSafeWKV else [( aaa), (bbb), (ccc), (ddd)])
+                ot = ot + [aaa, bbb, ccc, ddd, eee]
             x = ops.matvec(ops.layernorm(x, self.postprocess0, self.postprocess1),
                            self.postprocess2)
             return ops.convertToFloat32(x), ot
@@ -278,11 +251,11 @@ def RnnRWKV(ops: onnx_opslist.RWKVOnnxOps, *args):
                     ops.getIndex(self.emb, x),
                     self.emb1, self.emb2)
             if self.version == 4:
-                statea = state[0::(4+ops.useSafeWKV)]
-                stateb = state[1::(4+ops.useSafeWKV)]
-                statec = state[2::(4+ops.useSafeWKV)]
-                stated = state[3::(4+ops.useSafeWKV)]
-                statee = state[4::5] if ops.useSafeWKV else [None]*ops.n_layers
+                statea = state[0::5]
+                stateb = state[1::5]
+                statec = state[2::5]
+                stated = state[3::5]
+                statee = state[4::5]
 
                 ot = []
                 for i in range(ops.n_layers):
@@ -296,7 +269,7 @@ def RnnRWKV(ops: onnx_opslist.RWKVOnnxOps, *args):
                         i
                     )
 
-                    ot = ot + ([( aaa), (bbb), (ccc), (ddd), (eee)] if ops.useSafeWKV else [( aaa), (bbb), (ccc), (ddd)])
+                    ot = ot + [aaa, bbb, ccc, ddd, eee]
 
             else:
                 assert self.version == 5.1
@@ -339,7 +312,6 @@ def convert_model(path, dtype, version):
         dims,
         dtype=dtype,
         opsVersion=opset_version,
-        useSafeWKV=use_safe_wkv,
         externalData=use_external_data,
         splitExternalData=splitExternalData,
         fp32inout=fp32inout,
@@ -357,18 +329,18 @@ def convert():
     convert_model(path, dtype, 5.1)
 
 # Define the variables
-input_path = r"/Users/daquexian/Downloads/RWKV-5-ABC-82M-v1-20230901-ctx1024-fp32-converted.pth"
+input_path = r"RWKV-5-MIDI-560M-v1-20230902-ctx4096-fp32-converted.pth"
 if "convert" in input_path:
     converted = True
 else:
     converted = False
+assert converted
 use_fp16 = False
-use_safe_wkv = True
 use_external_data = True
 splitExternalData = False
 fp32inout = True
-# version, number either 15/17
-opset_version = 18
+# opset version, number either 15/17
+opset_version = 17
 
 # set seq mode and length
 seq_mode = False

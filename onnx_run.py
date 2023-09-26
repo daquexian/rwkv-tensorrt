@@ -65,7 +65,8 @@ def initONNXFile(path, useAllAvailableProviders=False):
         emptyState = []
         for i in range(layers):
             emptyState.append(np.zeros((embed,), dtype=typenum))
-            emptyState.append(np.zeros((8,64,64), dtype=typenum))
+            # NOTE: hardcode
+            emptyState.append(np.zeros((14,64,64), dtype=typenum))
             emptyState.append(np.zeros((embed,), dtype=typenum))
 
 
@@ -100,7 +101,8 @@ def npsample(ozut, temp: float = 1.0, top_p_usual: float = 0.8) -> int:
     return mout
 
 ########
-model, state = initONNXFile("./RWKV_24_512_32_18.onnx")
+# model, state = initONNXFile("RWKV-5-ABC-82M-v1-20230901-ctx1024-sim.onnx")
+model, state = initONNXFile("./RWKV_53_896_32_17.onnx")
 # model_seq, state_seq = initONNXFile("./RWKV_24_2048_32_17_seq.onnx")
 
 
@@ -120,15 +122,16 @@ model, state = initONNXFile("./RWKV_24_512_32_18.onnx")
 
 
 # prompt = tokenizer.encode(context)
-prompt = [5]
+prompt = [2]
 for token in prompt:
-    print('xxx')
     logits, state = model.forward([token],state)
+    import pdb; pdb.set_trace()
 
 
 # normal
-for i in range(100):
-    prompt = prompt+[npsample(logits)]
-    # print(tokenizer.decode(prompt[-1]),end="", flush=True)
+for i in range(1000):
+    prompt = prompt+[npsample(logits, top_p_usual=0)]
+    print(chr(prompt[-1]),end="", flush=True)
     logits, state = model.forward([prompt[-1]],state)
 print("\n")
+
